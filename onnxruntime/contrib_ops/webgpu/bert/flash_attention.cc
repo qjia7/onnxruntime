@@ -140,6 +140,7 @@ Status FlashAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
   const max_k_step: u32 = 16u;
   const vec_factor: u32 = 4u;
   const qkv_head_size_vec: u32 = qkv_head_size / vec_factor;
+  const half_qkv_head_size_vec = qkv_head_size_vec / 2u;
   const min_value : q_element_t = q_element_t(-65504.0);
 
   // Default SHM usage limit is 16KB in Dawn.
@@ -147,18 +148,18 @@ Status FlashAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
   var<workgroup> v_tile : array<array<q_value_t, qkv_head_size_vec>, max_k_step>; // 96 * 2 * 16 = 3KB.
 
   // Private memory per lane.
-  var<private> q_tile : array<q_value_t, qkv_head_size_vec>;
+  var<private> q_tile : array<q_value_t, half_qkv_head_size_vec>;
   var<private> o_tile : array<q_value_t, qkv_head_size_vec>;
-  fn loadq(q_idx_global : u32, head_idx: u32)
+  fn loadq(q_idx_global : u32, head_idx: u32, half: u32)
   {
       // Stored as float16[batch_size,sequence_length,3072] the inputs as per onnx MHA
       // This is the layout if TransferBSDToBNSH has not been run.
       let offset = q_idx_global * (qkv_head_size_vec) * num_heads + qkv_head_size_vec * head_idx;
       // Stored as BNSH - which is what webgpu uses after TransferBSDToBNSH has been run.
       //let offset = head_idx * uniforms.new_sequence_length * qkv_head_size_vec + q_idx_global * qkv_head_size_vec;
-      for (var idx:u32 = 0; idx < qkv_head_size_vec; idx++)
+      for (var idx:u32 = 0; idx < half_qkv_head_size_vec; idx++)
       {
-          q_tile[idx] = q[idx+offset];
+          q_tile[idx] = q[idx+offset+half];
       }
   }
   fn loadk(k_start : u32, head_idx: u32, local_idx: u32, k_step: u32)
@@ -225,16 +226,12 @@ Status FlashAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
   // Each lane/thread is responsible for a single q.
   shader.MainFunctionBody() << R"MAIN_FN(
   let head_idx = u32(workgroup_idx / uniforms.num_seq_tile);
-  let capped_sg_id = min(sg_id, max_k_step);
+  let capped_sg_id = min(sg_id, max_k_step - 1u);
   let capped_sg_size = min(sg_size, max_k_step);
 
   // Load Q
   let q_idx_global = (workgroup_idx % uniforms.num_seq_tile) * workgroup_size_x + local_idx;
   let valid_q = q_idx_global < uniforms.new_sequence_length;
-  if (valid_q)
-  {
-    loadq(q_idx_global, head_idx);
-  }
 
   var previous_max : q_element_t = min_value;
   var previous_denom : q_element_t = 0;
@@ -253,9 +250,39 @@ Status FlashAttentionProgram::GenerateShaderCode(ShaderHelper& shader) const {
     var qk_4:vec4<q_element_t>;
     if (sg_size > 8)
     {
-      for (var i:u32 = 0u; i < qkv_head_size_vec; i++)
+      if (valid_q)
+      {
+        loadq(q_idx_global, head_idx, 0u);
+      }
+      for (var i:u32 = 0u; i < half_qkv_head_size_vec; i++)
       {
         var k_local = k_tile[capped_sg_id][i];
+        var q_own = q_tile[i];
+        qk_1[0] += dot(q_own, subgroupShuffle(k_local, 0));
+        qk_1[1] += dot(q_own, subgroupShuffle(k_local, 1));
+        qk_1[2] += dot(q_own, subgroupShuffle(k_local, 2));
+        qk_1[3] += dot(q_own, subgroupShuffle(k_local, 3));
+        qk_2[0] += dot(q_own, subgroupShuffle(k_local, 4));
+        qk_2[1] += dot(q_own, subgroupShuffle(k_local, 5));
+        qk_2[2] += dot(q_own, subgroupShuffle(k_local, 6));
+        qk_2[3] += dot(q_own, subgroupShuffle(k_local, 7));
+        qk_3[0] += dot(q_own, subgroupShuffle(k_local, 8));
+        qk_3[1] += dot(q_own, subgroupShuffle(k_local, 9));
+        qk_3[2] += dot(q_own, subgroupShuffle(k_local, 10));
+        qk_3[3] += dot(q_own, subgroupShuffle(k_local, 11));
+        qk_4[0] += dot(q_own, subgroupShuffle(k_local, 12));
+        qk_4[1] += dot(q_own, subgroupShuffle(k_local, 13));
+        qk_4[2] += dot(q_own, subgroupShuffle(k_local, 14));
+        qk_4[3] += dot(q_own, subgroupShuffle(k_local, 15));
+      }
+
+      if (valid_q)
+      {
+        loadq(q_idx_global, head_idx, half_qkv_head_size_vec);
+      }
+      for (var i:u32 = 0u; i < half_qkv_head_size_vec; i++)
+      {
+        var k_local = k_tile[capped_sg_id][half_qkv_head_size_vec + i];
         var q_own = q_tile[i];
         qk_1[0] += dot(q_own, subgroupShuffle(k_local, 0));
         qk_1[1] += dot(q_own, subgroupShuffle(k_local, 1));
