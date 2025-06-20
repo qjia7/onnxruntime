@@ -15,7 +15,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     kWebGpuExecutionProvider,
     (*KernelDefBuilder::Create())
         .OutputMemoryType(OrtMemTypeCPU, 0)
-        .TypeConstraint("T", WebGpuSupportedNumberTypes())
+        .TypeConstraint("T", WebGpuSupportedNumberTypesExtended())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int64_t>()),
     Shape);
 
@@ -26,7 +26,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     kWebGpuExecutionProvider,
     (*KernelDefBuilder::Create())
         .OutputMemoryType(OrtMemTypeCPU, 0)
-        .TypeConstraint("T", WebGpuSupportedNumberTypes())
+        .TypeConstraint("T", WebGpuSupportedNumberTypesExtended())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int64_t>()),
     Shape);
 
@@ -37,7 +37,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     kWebGpuExecutionProvider,
     (*KernelDefBuilder::Create())
         .OutputMemoryType(OrtMemTypeCPU, 0)
-        .TypeConstraint("T", WebGpuSupportedNumberTypes())
+        .TypeConstraint("T", WebGpuSupportedNumberTypesExtended())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int64_t>()),
     Shape);
 
@@ -48,7 +48,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     kWebGpuExecutionProvider,
     (*KernelDefBuilder::Create())
         .OutputMemoryType(OrtMemTypeCPU, 0)
-        .TypeConstraint("T", WebGpuSupportedNumberTypes())
+        .TypeConstraint("T", WebGpuSupportedNumberTypesExtended())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int64_t>()),
     Shape);
 
@@ -59,7 +59,7 @@ ONNX_OPERATOR_VERSIONED_KERNEL_EX(
     kWebGpuExecutionProvider,
     (*KernelDefBuilder::Create())
         .OutputMemoryType(OrtMemTypeCPU, 0)
-        .TypeConstraint("T", WebGpuSupportedNumberTypes())
+        .TypeConstraint("T", WebGpuSupportedNumberTypesExtended())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int64_t>()),
     Shape);
 
@@ -70,7 +70,7 @@ ONNX_OPERATOR_KERNEL_EX(
     kWebGpuExecutionProvider,
     (*KernelDefBuilder::Create())
         .OutputMemoryType(OrtMemTypeCPU, 0)
-        .TypeConstraint("T", WebGpuSupportedNumberTypes())
+        .TypeConstraint("T", WebGpuSupportedNumberTypesExtended())
         .TypeConstraint("T1", DataTypeImpl::GetTensorType<int64_t>()),
     Shape);
 

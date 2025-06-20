@@ -20,7 +20,8 @@ const std::vector<MLDataType>& CastOpTypeConstraints() {
       DataTypeImpl::GetTensorType<float>(),
       DataTypeImpl::GetTensorType<int32_t>(),
       DataTypeImpl::GetTensorType<uint32_t>(),
-      DataTypeImpl::GetTensorType<bool>()};
+      DataTypeImpl::GetTensorType<bool>(),
+      DataTypeImpl::GetTensorType<int64_t>()};
   return types;
 }
 }  // namespace
@@ -69,12 +70,13 @@ Status Cast::ComputeInternal(ComputeContext& context) const {
   if (size == 0) {
     return Status::OK();
   }
-  uint32_t vec_size = onnxruntime::narrow<uint32_t>((size + 3) / 4);
+  const int components = to_ == ONNX_NAMESPACE::TensorProto_DataType_INT64 || input_tensor->DataType() == DataTypeImpl::GetType<int64_t>() ? 1 : 4;
+  uint32_t vec_size = onnxruntime::narrow<uint32_t>(components == 1 ? size : (size + 3) / 4);
 
   CastProgram program{to_};
   program
-      .AddInput({input_tensor, ProgramTensorMetadataDependency::Type, {vec_size}, 4})
-      .AddOutput({output_tensor, ProgramTensorMetadataDependency::None, {vec_size}, 4})
+      .AddInput({input_tensor, ProgramTensorMetadataDependency::Type, {vec_size}, components})
+      .AddOutput({output_tensor, ProgramTensorMetadataDependency::Type, {vec_size}, components})
       .SetDispatchGroupSize((vec_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
       .AddUniformVariables({
           {static_cast<uint32_t>(vec_size)},
@@ -87,24 +89,46 @@ Status CastProgram::GenerateShaderCode(ShaderHelper& sh) const {
   const auto& input = sh.AddInput("x", ShaderUsage::UseUniform);
   const auto& output = sh.AddOutput("y", ShaderUsage::UseUniform);
   std::string expression;
-  switch (to_) {
-    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
-      expression = "vec4<f16>(a)";
-      break;
-    case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
-      expression = "vec4<f32>(a)";
-      break;
-    case ONNX_NAMESPACE::TensorProto_DataType_INT32:
-      expression = "vec4<i32>(a)";
-      break;
-    case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
-      expression = "vec4<u32>(a)";
-      break;
-    case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
-      expression = "vec4<bool>(a)";
-      break;
-    default:
-      ORT_NOT_IMPLEMENTED("Cast to type ", to_, " is not supported.");
+  if (output.NumComponents() == 1) {
+    switch (to_) {
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
+        expression = "f16(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
+        expression = "f32(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT32:
+        expression = "i32(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+        expression = "u32(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT64:
+        expression = "vec2<i32>(a)";
+        break;
+      default:
+        ORT_NOT_IMPLEMENTED("Cast to type ", to_, " is not supported.");
+    }
+  } else if (output.NumComponents() == 4) {
+    switch (to_) {
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT16:
+        expression = "vec4<f16>(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_FLOAT:
+        expression = "vec4<f32>(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_INT32:
+        expression = "vec4<i32>(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_UINT32:
+        expression = "vec4<u32>(a)";
+        break;
+      case ONNX_NAMESPACE::TensorProto_DataType_BOOL:
+        expression = "vec4<bool>(a)";
+        break;
+      default:
+        ORT_NOT_IMPLEMENTED("Cast to type ", to_, " is not supported.");
+    }
   }
   sh.MainFunctionBody() << sh.GuardAgainstOutOfBoundsWorkgroupSizes("uniforms.vec_size")
                         << "  let a = " << input.GetByOffset("global_idx") << ";\n  "

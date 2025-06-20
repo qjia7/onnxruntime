@@ -71,9 +71,9 @@ Status Gather::ComputeInternal(ComputeContext& context) const {
       KernelDefBuilder().TypeConstraint("T", TYPE).TypeConstraint("Tind", BuildKernelDefConstraintsFromTypeList<TypeList<int32_t, int64_t>>()), \
       KERNEL_CLASS);
 
-WEBGPU_GATHER_VERSIONED_KERNEL(Gather, 1, 10, Gather, WebGpuSupportedNumberTypes())
-WEBGPU_GATHER_VERSIONED_KERNEL(Gather, 11, 12, Gather, WebGpuSupportedNumberTypes())
-WEBGPU_GATHER_KERNEL(Gather, 13, Gather, WebGpuSupportedNumberTypes())
+WEBGPU_GATHER_VERSIONED_KERNEL(Gather, 1, 10, Gather, WebGpuSupportedNumberTypesExtended())
+WEBGPU_GATHER_VERSIONED_KERNEL(Gather, 11, 12, Gather, WebGpuSupportedNumberTypesExtended())
+WEBGPU_GATHER_KERNEL(Gather, 13, Gather, WebGpuSupportedNumberTypesExtended())
 
 }  // namespace webgpu
 }  // namespace onnxruntime
