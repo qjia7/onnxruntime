@@ -174,21 +174,22 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                                     << "  const block_size = " << block_size_ << ";";
 
   shader.AdditionalImplementation() << R"ADDNL_FN(
-        const tile_size = 64;
-        const subtile_size = 16;
+        const tile_size_m = 64;
+        const tile_size_n = 128;
+        const subtile_size = 32;
         const tile_size_k =  32;
         const vec_factor = 4;
         const u32_factor = 4;
         const tile_size_k_vec = 2;
 
         // Shared memory
-        var<workgroup> tile_A : array<array<vec4<u32>, tile_size>, tile_size_k_vec>;                     // 64 x 32
-        var<workgroup> scale_A : array<output_element_t, tile_size>;                                     // 64 x 1
-        var<workgroup> tile_B : array<array<vec4<u32>, tile_size>, tile_size_k_vec>;                     // 64 x 32
-        var<workgroup> scale_B : array<output_element_t, tile_size>;                                     // 64 x 1
+        var<workgroup> tile_A : array<array<vec4<u32>, tile_size_m>, tile_size_k_vec>;                     // 64 x 32
+        var<workgroup> scale_A : array<output_element_t, tile_size_m>;                                     // 64 x 1
+        var<workgroup> tile_B : array<array<vec4<u32>, tile_size_n>, tile_size_k_vec>;                     // 128 x 32
+        var<workgroup> scale_B : array<output_element_t, tile_size_n>;                                     // 128 x 1
     )ADDNL_FN";
   if (nbits_ == 8 && has_zero_points_) {
-    shader.AdditionalImplementation() << "        var<workgroup> zeroes : array<i32, tile_size>;";
+    shader.AdditionalImplementation() << "        var<workgroup> zeroes : array<i32, tile_size_n>;";
   }
   shader.AdditionalImplementation() << R"ADDNL_FN(
         fn loadSHMA(a_global_base:u32, kidx_v:u32, row: u32, col: u32)
@@ -258,10 +259,10 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
   shader.MainFunctionBody() << R"MAIN_FN(
         // During the load phase we use all 256 threads to load 64 rows of A/B.
         // For each row we load tile_size_k_vec (2) vectorized elements, which are 32 elements of K.
-        let a_global_base = u32(workgroup_idx / uniforms.num_N_tile) * tile_size;
-        let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size;
-        let load_AorB = u32(local_idx/128);
-        let load_row = u32((local_idx%128)/2);
+        let a_global_base = u32(workgroup_idx / uniforms.num_N_tile) * tile_size_m;
+        let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size_n;
+      //  let load_AorB = u32(local_idx/128);
+      //  let load_row = u32((local_idx%128)/2);
         let load_col = u32(local_idx%2);
 
         // During the compute phase, we have the 64x64 tile split into
@@ -269,8 +270,8 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
         let subtile_id = u32(local_idx / subtile_size);
         let subtile_idx = u32(subtile_id / 4);
         let subtile_idy = u32(subtile_id % 4);
-        let base_A = subtile_idx * 16;
-        let base_B = subtile_idy * 16;
+        let base_A = subtile_idx * 32;
+        let base_B = subtile_idy * 32;
         // For each subtile we have 16 threads assigned.
         let a_idx = u32(local_idx % subtile_size);
 
@@ -278,20 +279,21 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
         var lane_output2: vec4<output_element_t>;
         var lane_output3: vec4<output_element_t>;
         var lane_output4: vec4<output_element_t>;
+        var lane_output5: vec4<output_element_t>;
+        var lane_output6: vec4<output_element_t>;
+        var lane_output7: vec4<output_element_t>;
+        var lane_output8: vec4<output_element_t>;
         // K's vectrorization is 16 items per index. See input_a/input_b.
         // tile_size_k_vec - is the k tile size in vectorized space (1/16). That is
         // k tile size is 32. In vectorized space that is 32/16 = 2.
         for (var kidx_v:u32 = 0; kidx_v < uniforms.K16; kidx_v+=tile_size_k_vec)
         {
             // Load Phase: Populate shared memory for the workgroup.
-            if (load_AorB == 0)
+            if (local_idx < 128)
             {
-                loadSHMA(a_global_base, kidx_v, load_row, load_col);
+                loadSHMA(a_global_base, kidx_v, local_idx/2, load_col);
             }
-            else
-            {
-                loadSHMB(b_global_base, kidx_v, load_row, load_col);
-            }
+            loadSHMB(b_global_base, kidx_v, local_idx/2, load_col);
             workgroupBarrier();
 
             // Compute phase: Perform matmul for this subtile 16 x 32 x 16.
@@ -383,6 +385,51 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                 lane_output4[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 14), own_a1, subgroupShuffle(own_b1, 14), subgroupShuffle(own_scale_b, 14) * own_scale_a);
                 lane_output4[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 15), own_a1, subgroupShuffle(own_b1, 15), subgroupShuffle(own_scale_b, 15) * own_scale_a);
             }
+            else if (sg_size == 32){
+                var own_b0: vec4<u32> = tile_B[0][base_B + sg_id];
+                var own_b1: vec4<u32> = tile_B[1][base_B + sg_id];
+                var own_scale_b: output_element_t  = scale_B[base_B + sg_id];
+                // Step 2: Access registers across the subgroup using subgroupShuffle and perform the matmul.
+                lane_output1[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 0), own_a1, subgroupShuffle(own_b1, 0), subgroupShuffle(own_scale_b, 0) * own_scale_a);
+                lane_output1[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 1), own_a1, subgroupShuffle(own_b1, 1), subgroupShuffle(own_scale_b, 1) * own_scale_a);
+                lane_output1[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 2), own_a1, subgroupShuffle(own_b1, 2), subgroupShuffle(own_scale_b, 2) * own_scale_a);
+                lane_output1[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 3), own_a1, subgroupShuffle(own_b1, 3), subgroupShuffle(own_scale_b, 3) * own_scale_a);
+
+                lane_output2[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 4), own_a1, subgroupShuffle(own_b1, 4), subgroupShuffle(own_scale_b, 4) * own_scale_a);
+                lane_output2[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 5), own_a1, subgroupShuffle(own_b1, 5), subgroupShuffle(own_scale_b, 5) * own_scale_a);
+                lane_output2[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 6), own_a1, subgroupShuffle(own_b1, 6), subgroupShuffle(own_scale_b, 6) * own_scale_a);
+                lane_output2[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 7), own_a1, subgroupShuffle(own_b1, 7), subgroupShuffle(own_scale_b, 7) * own_scale_a);
+
+                lane_output3[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 8), own_a1, subgroupShuffle(own_b1, 8), subgroupShuffle(own_scale_b, 8) * own_scale_a);
+                lane_output3[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 9), own_a1, subgroupShuffle(own_b1, 9), subgroupShuffle(own_scale_b, 9) * own_scale_a);
+                lane_output3[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 10), own_a1, subgroupShuffle(own_b1, 10), subgroupShuffle(own_scale_b, 10) * own_scale_a);
+                lane_output3[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 11), own_a1, subgroupShuffle(own_b1, 11), subgroupShuffle(own_scale_b, 11) * own_scale_a);
+
+                lane_output4[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 12), own_a1, subgroupShuffle(own_b1, 12), subgroupShuffle(own_scale_b, 12) * own_scale_a);
+                lane_output4[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 13), own_a1, subgroupShuffle(own_b1, 13), subgroupShuffle(own_scale_b, 13) * own_scale_a);
+                lane_output4[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 14), own_a1, subgroupShuffle(own_b1, 14), subgroupShuffle(own_scale_b, 14) * own_scale_a);
+                lane_output4[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 15), own_a1, subgroupShuffle(own_b1, 15), subgroupShuffle(own_scale_b, 15) * own_scale_a);
+
+                lane_output5[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 16), own_a1, subgroupShuffle(own_b1, 16), subgroupShuffle(own_scale_b, 16) * own_scale_a);
+                lane_output5[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 17), own_a1, subgroupShuffle(own_b1, 17), subgroupShuffle(own_scale_b, 17) * own_scale_a);
+                lane_output5[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 18), own_a1, subgroupShuffle(own_b1, 18), subgroupShuffle(own_scale_b, 18) * own_scale_a);
+                lane_output5[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 19), own_a1, subgroupShuffle(own_b1, 19), subgroupShuffle(own_scale_b, 19) * own_scale_a);
+
+                lane_output6[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 20), own_a1, subgroupShuffle(own_b1, 20), subgroupShuffle(own_scale_b, 20) * own_scale_a);
+                lane_output6[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 21), own_a1, subgroupShuffle(own_b1, 21), subgroupShuffle(own_scale_b, 21) * own_scale_a);
+                lane_output6[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 22), own_a1, subgroupShuffle(own_b1, 22), subgroupShuffle(own_scale_b, 22) * own_scale_a);
+                lane_output6[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 23), own_a1, subgroupShuffle(own_b1, 23), subgroupShuffle(own_scale_b, 23) * own_scale_a);
+
+                lane_output7[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 24), own_a1, subgroupShuffle(own_b1, 24), subgroupShuffle(own_scale_b, 24) * own_scale_a);
+                lane_output7[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 25), own_a1, subgroupShuffle(own_b1, 25), subgroupShuffle(own_scale_b, 25) * own_scale_a);
+                lane_output7[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 26), own_a1, subgroupShuffle(own_b1, 26), subgroupShuffle(own_scale_b, 26) * own_scale_a);
+                lane_output7[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 27), own_a1, subgroupShuffle(own_b1, 27), subgroupShuffle(own_scale_b, 27) * own_scale_a);
+
+                lane_output8[0] += SDP8AI(own_a0, subgroupShuffle(own_b0, 28), own_a1, subgroupShuffle(own_b1, 28), subgroupShuffle(own_scale_b, 28) * own_scale_a);
+                lane_output8[1] += SDP8AI(own_a0, subgroupShuffle(own_b0, 29), own_a1, subgroupShuffle(own_b1, 29), subgroupShuffle(own_scale_b, 29) * own_scale_a);
+                lane_output8[2] += SDP8AI(own_a0, subgroupShuffle(own_b0, 30), own_a1, subgroupShuffle(own_b1, 30), subgroupShuffle(own_scale_b, 30) * own_scale_a);
+                lane_output8[3] += SDP8AI(own_a0, subgroupShuffle(own_b0, 31), own_a1, subgroupShuffle(own_b1, 31), subgroupShuffle(own_scale_b, 31) * own_scale_a);
+            }
             else
             {
                 // Code for other subgroup sizes, simply doesnt use subgroups at all.
@@ -407,6 +454,26 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                 lane_output4[1] += SDP8AI(own_a0, tile_B[0][base_B + 13], own_a1, tile_B[1][base_B + 13],  own_scale_a * scale_B[base_B + 13]);
                 lane_output4[2] += SDP8AI(own_a0, tile_B[0][base_B + 14], own_a1, tile_B[1][base_B + 14],  own_scale_a * scale_B[base_B + 14]);
                 lane_output4[3] += SDP8AI(own_a0, tile_B[0][base_B + 15], own_a1, tile_B[1][base_B + 15],  own_scale_a * scale_B[base_B + 15]);
+
+                lane_output5[0] += SDP8AI(own_a0, tile_B[0][base_B + 16], own_a1, tile_B[1][base_B + 16],  own_scale_a * scale_B[base_B + 16]);
+                lane_output5[1] += SDP8AI(own_a0, tile_B[0][base_B + 17], own_a1, tile_B[1][base_B + 17],  own_scale_a * scale_B[base_B + 17]);
+                lane_output5[2] += SDP8AI(own_a0, tile_B[0][base_B + 18], own_a1, tile_B[1][base_B + 18],  own_scale_a * scale_B[base_B + 18]);
+                lane_output5[3] += SDP8AI(own_a0, tile_B[0][base_B + 19], own_a1, tile_B[1][base_B + 19],  own_scale_a * scale_B[base_B + 19]);
+
+                lane_output6[0] += SDP8AI(own_a0, tile_B[0][base_B + 20], own_a1, tile_B[1][base_B + 20],  own_scale_a * scale_B[base_B + 20]);
+                lane_output6[1] += SDP8AI(own_a0, tile_B[0][base_B + 21], own_a1, tile_B[1][base_B + 21],  own_scale_a * scale_B[base_B + 21]);
+                lane_output6[2] += SDP8AI(own_a0, tile_B[0][base_B + 22], own_a1, tile_B[1][base_B + 22],  own_scale_a * scale_B[base_B + 22]);
+                lane_output6[3] += SDP8AI(own_a0, tile_B[0][base_B + 23], own_a1, tile_B[1][base_B + 23],  own_scale_a * scale_B[base_B + 23]);
+
+                lane_output7[0] += SDP8AI(own_a0, tile_B[0][base_B + 24], own_a1, tile_B[1][base_B + 24],  own_scale_a * scale_B[base_B + 24]);
+                lane_output7[1] += SDP8AI(own_a0, tile_B[0][base_B + 25], own_a1, tile_B[1][base_B + 25],  own_scale_a * scale_B[base_B + 25]);
+                lane_output7[2] += SDP8AI(own_a0, tile_B[0][base_B + 26], own_a1, tile_B[1][base_B + 26],  own_scale_a * scale_B[base_B + 26]);
+                lane_output7[3] += SDP8AI(own_a0, tile_B[0][base_B + 27], own_a1, tile_B[1][base_B + 27],  own_scale_a * scale_B[base_B + 27]);
+
+                lane_output8[0] += SDP8AI(own_a0, tile_B[0][base_B + 28], own_a1, tile_B[1][base_B + 28],  own_scale_a * scale_B[base_B + 28]);
+                lane_output8[1] += SDP8AI(own_a0, tile_B[0][base_B + 29], own_a1, tile_B[1][base_B + 29],  own_scale_a * scale_B[base_B + 29]);
+                lane_output8[2] += SDP8AI(own_a0, tile_B[0][base_B + 30], own_a1, tile_B[1][base_B + 30],  own_scale_a * scale_B[base_B + 30]);
+                lane_output8[3] += SDP8AI(own_a0, tile_B[0][base_B + 31], own_a1, tile_B[1][base_B + 31],  own_scale_a * scale_B[base_B + 31]);
             }
     )MAIN_FN";
   }
@@ -424,6 +491,12 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
             output[output_idx+1] = lane_output2;
             output[output_idx+2] = lane_output3;
             output[output_idx+3] = lane_output4;
+            if (sg_size == 32) {
+                output[output_idx+4] = lane_output5;
+                output[output_idx+5] = lane_output6;
+                output[output_idx+6] = lane_output7;
+                output[output_idx+7] = lane_output8;
+            }
         }
     )MAIN_FN";
 
@@ -613,10 +686,11 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
     return context.RunProgram(mul_program);
   }
 
-  constexpr uint32_t kTileSize = 64;
+  constexpr uint32_t kTileSizeM = 64;
+  constexpr uint32_t kTileSizeN = 128;
   TensorShape reshaped_y_shape{1, M, N / kVec4Components};
-  uint32_t num_M_tile = (M + kTileSize - 1) / kTileSize;
-  uint32_t num_N_tile = (N + kTileSize - 1) / kTileSize;
+  uint32_t num_M_tile = (M + kTileSizeM - 1) / kTileSizeM;
+  uint32_t num_N_tile = (N + kTileSizeN - 1) / kTileSizeN;
   DP4AMatMulNBitsProgram mul_program{block_size, nbits, has_zero_points};
   mul_program.SetWorkgroupSize(256);
   mul_program.SetDispatchGroupSize(num_M_tile * num_N_tile);
