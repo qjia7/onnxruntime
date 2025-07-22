@@ -65,6 +65,33 @@ class DP4AMatMulNBitsSmallMProgram final : public Program<DP4AMatMulNBitsSmallMP
   bool has_zero_points_;
 };
 
+class DP4AMatMulNBitsLargeMProgram final : public Program<DP4AMatMulNBitsLargeMProgram> {
+ public:
+  DP4AMatMulNBitsLargeMProgram(uint32_t tile_size_k_vec, uint32_t tile_size, uint32_t nbits, bool has_zero_points) : Program{"DP4AMatMulNBitsLargeMProgram"},
+                                                                                                                     tile_size_k_vec_(tile_size_k_vec),
+                                                                                                                     tile_size_(tile_size),
+                                                                                                                     nbits_(nbits),
+                                                                                                                     has_zero_points_(has_zero_points) {
+  }
+  Status GenerateShaderCode(ShaderHelper& sh) const override;
+  WEBGPU_PROGRAM_DEFINE_UNIFORM_VARIABLES(
+      {"M", ProgramUniformVariableDataType::Uint32},
+      {"N", ProgramUniformVariableDataType::Uint32},
+      {"K", ProgramUniformVariableDataType::Uint32},
+      {"K16", ProgramUniformVariableDataType::Uint32},
+      {"K32", ProgramUniformVariableDataType::Uint32},
+      {"block_size", ProgramUniformVariableDataType::Uint32},
+      {"num_N_tile", ProgramUniformVariableDataType::Uint32},
+      {"num_M_tile", ProgramUniformVariableDataType::Uint32},
+      {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32});
+
+ private:
+  uint32_t tile_size_k_vec_;
+  uint32_t tile_size_;
+  uint32_t nbits_;
+  bool has_zero_points_;
+};
+
 Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                   const Tensor* zero_points,
                                   uint32_t M,

@@ -575,6 +575,116 @@ Status DP4AMatMulNBitsSmallMProgram::GenerateShaderCode(ShaderHelper& shader) co
   return Status::OK();
 }
 
+Status DP4AMatMulNBitsLargeMProgram::GenerateShaderCode(ShaderHelper& shader) const {
+  shader.AddInput("input_a", ShaderUsage::UseUniform);
+  shader.AddInput("scales_a", ShaderUsage::UseUniform);
+  shader.AddInput("input_b", ShaderUsage::UseUniform);
+  shader.AddInput("scales_b", ShaderUsage::UseUniform);
+  if (has_zero_points_) {
+    shader.AddInput("zero_points", ShaderUsage::UseUniform);
+  }
+  shader.AddOutput("output", ShaderUsage::UseUniform | ShaderUsage::UseElementTypeAlias);
+
+  //   ORT_ENFORCE(WorkgroupSizeX() % tile_size_k_vec_ == 0 && tile_size_k_vec_ % 4 == 0, "tile_size_k_vec_ must evenly divide workgroup size X and be divisible by 4");
+  const uint32_t sub_tile_count = WorkgroupSizeX() / tile_size_k_vec_;
+  //  ORT_ENFORCE(tile_size_ % sub_tile_count == 0, "tile_size_ must be divisible by sub_tile_count");
+
+  shader.AdditionalImplementation() << "  const tile_size_n = " << tile_size_ << "u;\n"
+                                    << "  const tile_size_m = 32u;\n"
+                                    << "  const tile_size_k_vec = " << tile_size_k_vec_ << "u;\n"
+                                    << "  const double_tile_size_k_vec = " << 2 * tile_size_k_vec_ << "u;\n"
+                                    // sub_tile_count is the number of concurrent b rows processed by the workgroup.
+                                    << "  const sub_tile_count = " << sub_tile_count << "u;\n";
+
+  shader.AdditionalImplementation() << CommonFunctions(nbits_, has_zero_points_)
+                                    << R"ADDNL_FN(
+    var<workgroup> tile_A : array<array<vec4<u32>, double_tile_size_k_vec>, tile_size_m>;
+    var<workgroup> scale_A : array<output_element_t, tile_size_m>;
+    fn loadSHMA(a_global_base: u32, kidx_v: u32, row: u32, col: u32)
+    {
+      let a_global = a_global_base + row;
+      let k_offset = kidx_v + col;
+      if (a_global >= uniforms.M || k_offset >= uniforms.K16) {
+        return;
+      }
+
+      tile_A[row][col] = input_a[a_global*uniforms.K16+k_offset];
+      if (col == 0)
+      {
+        // kidx_v - covers 16 values of k
+        scale_A[row] = scales_a[a_global*(uniforms.K/128) + kidx_v/8];
+      }
+    }
+  )ADDNL_FN";
+
+  shader.MainFunctionBody() << R"MAIN_FN(
+    let a_global_base = u32(workgroup_idx / uniforms.num_M_tile) * tile_size_m;
+    let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size_n;
+    // Handle each workgroup threads as a block of [sub_tile_count][tile_size_k_vec]
+    let local_col = local_idx % tile_size_k_vec;
+    let local_row = local_idx / tile_size_k_vec;
+    var results : array<output_element_t, tile_size_m>;
+    for (var kidx_v:u32 = 0; kidx_v < uniforms.K32; kidx_v += tile_size_k_vec)
+    {
+      // Load Phase: Populate shared memory for the workgroup.
+      loadSHMA(a_global_base, kidx_v * 2, local_idx / double_tile_size_k_vec, local_idx % double_tile_size_k_vec);
+      workgroupBarrier();
+
+      let k_offset = kidx_v + local_col;
+      // k_offset - covers 32 values of k in input_b
+      let block_idx = k_offset * 32 / uniforms.block_size;
+      // calculate intermediate results into inter_results.
+      for (var row_offset = 0u; row_offset < tile_size_n; row_offset += sub_tile_count) {
+        let b_global = b_global_base + row_offset + local_row;
+        if (b_global < uniforms.N && k_offset < uniforms.K32)
+        {
+          let b_offset = b_global * uniforms.K32 + k_offset;
+          let zero = mm_read_zero(b_global, block_idx, uniforms.N, uniforms.zero_blocks_per_col);
+          let own_scale_b = scales_b[b_global * uniforms.K / uniforms.block_size + block_idx];
+  )MAIN_FN";
+  if (nbits_ == 4) {
+    shader.MainFunctionBody() << R"MAIN_FN(
+          let b_value = input_b[b_offset];
+          let own_b = DequantizedFrom4BitsTo8Bits(b_value.xy, zero);
+          let own_b1 = DequantizedFrom4BitsTo8Bits(b_value.zw, zero);
+          for (var m_idx = 0u; m_idx < tile_size_m; m_idx++) {
+            let own_a = tile_A[m_idx][0u];
+            let own_a1 = tile_A[m_idx][1u];
+            results[m_idx] += SDP8AI(own_a, own_b, own_a1, own_b1, scale_A[m_idx] * own_scale_b);
+          }
+  )MAIN_FN";
+  } else {
+    shader.MainFunctionBody() << R"MAIN_FN(
+          let own_b = AlignWithZeroPoint(input_b[b_offset * 2]);
+          let own_b1 = AlignWithZeroPoint(input_b[b_offset * 2 + 1]);
+  )MAIN_FN";
+    if (has_zero_points_) {
+      shader.MainFunctionBody() << "          inter_results[row_offset + local_row][local_col] += SDP8AI(own_a, own_b, own_a1, own_b1, own_scale_a * own_scale_b, zero);\n";
+    } else {
+      shader.MainFunctionBody() << "          inter_results[row_offset + local_row][local_col] += SDP8AI(own_a, own_b, own_a1, own_b1, own_scale_a * own_scale_b);\n";
+    }
+  }
+  shader.MainFunctionBody() << R"MAIN_FN(
+        }
+      }
+      workgroupBarrier();
+    }
+
+    let b_global =  b_global_base + local_idx;
+    if (b_global < uniforms.N) {
+      for (var m_idx = 0u; m_idx < tile_size_m; m_idx++) {
+        let a_global = a_global_base + m_idx;
+        if (a_global < uniforms.M) {
+          let output_idx = a_global * uniforms.N + b_global;
+          output[output_idx] = results[m_idx];
+        }
+      }
+    }
+  )MAIN_FN";
+
+  return Status::OK();
+}
+
 Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor* scales,
                                   const Tensor* zero_points,
                                   uint32_t M,
@@ -587,7 +697,7 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
                                   onnxruntime::webgpu::ComputeContext& context,
                                   Tensor* y) {
   constexpr uint32_t kVec4Components = 4;
-  constexpr uint32_t kVec2Components = 2;
+//  constexpr uint32_t kVec2Components = 2;
   constexpr uint32_t kU32Components = 4;
 
   constexpr uint32_t kBlockSizeA = 128;
@@ -623,31 +733,52 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
     }
     return context.RunProgram(mul_program);
   }
+  uint32_t tile_size_k_vec = 1;
+  uint32_t tile_size_N = 64;
+  uint32_t tile_size_M = 32;
 
-  constexpr uint32_t kTileSize = 64;
-  TensorShape reshaped_y_shape{1, M, N};
-  uint32_t num_M_tile = (M + kTileSize - 1) / kTileSize;
-  uint32_t num_N_tile = (N + kTileSize - 1) / kTileSize;
-  DP4AMatMulNBitsProgram mul_program{block_size, nbits, has_zero_points};
-  mul_program.SetWorkgroupSize(256);
+  DP4AMatMulNBitsLargeMProgram mul_program{tile_size_k_vec, tile_size_N, nbits, has_zero_points};
+  uint32_t num_N_tile = (N + tile_size_N - 1) / tile_size_N;
+  uint32_t num_M_tile = (M + tile_size_M - 1) / tile_size_M;
+  mul_program.SetWorkgroupSize(64);
   mul_program.SetDispatchGroupSize(num_M_tile * num_N_tile);
   mul_program.AddInputs({{&a_quant, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(kVec4Components)},
                          {&a_scale, ProgramTensorMetadataDependency::TypeAndRank, 1},
-                         {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(nbits == 4 ? kVec2Components * kU32Components : kVec4Components * kU32Components)},
+                         {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(kVec4Components * kU32Components)},
                          {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
-      .AddUniformVariables({{static_cast<uint32_t>(M)},
-                            {static_cast<uint32_t>(N)},
-                            {static_cast<uint32_t>(K)},
-                            {static_cast<uint32_t>(K / 8)},
-                            {static_cast<uint32_t>(K / 16)},
-                            {num_N_tile},
-                            {zero_blocks_per_col}})
-      .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, reshaped_y_shape, 1})
-      .CacheHint("Block" + std::to_string(block_size), nbits, has_zero_points);
+      .AddUniformVariables({M, N, K, K / 16, K / 32, block_size, num_N_tile, num_M_tile, zero_blocks_per_col})
+      .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, 1})
+      .CacheHint(nbits, tile_size_k_vec, tile_size_N, has_zero_points);
   if (has_zero_points) {
     mul_program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
   }
   return context.RunProgram(mul_program);
+  /*
+    constexpr uint32_t kTileSize = 64;
+    TensorShape reshaped_y_shape{1, M, N};
+    uint32_t num_M_tile = (M + kTileSize - 1) / kTileSize;
+    uint32_t num_N_tile = (N + kTileSize - 1) / kTileSize;
+    DP4AMatMulNBitsProgram mul_program{block_size, nbits, has_zero_points};
+    mul_program.SetWorkgroupSize(256);
+    mul_program.SetDispatchGroupSize(num_M_tile * num_N_tile);
+    mul_program.AddInputs({{&a_quant, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(kVec4Components)},
+                           {&a_scale, ProgramTensorMetadataDependency::TypeAndRank, 1},
+                           {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(nbits == 4 ? kVec2Components * kU32Components : kVec4Components * kU32Components)},
+                           {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
+        .AddUniformVariables({{static_cast<uint32_t>(M)},
+                              {static_cast<uint32_t>(N)},
+                              {static_cast<uint32_t>(K)},
+                              {static_cast<uint32_t>(K / 8)},
+                              {static_cast<uint32_t>(K / 16)},
+                              {num_N_tile},
+                              {zero_blocks_per_col}})
+        .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, reshaped_y_shape, 1})
+        .CacheHint("Block" + std::to_string(block_size), nbits, has_zero_points);
+    if (has_zero_points) {
+      mul_program.AddInput({zero_points, ProgramTensorMetadataDependency::None, {(zero_points->Shape().Size() + 3) / 4}, 4});
+    }
+    return context.RunProgram(mul_program);
+    */
 }
 
 bool CanApplyDP4AMatrixMatMulNBits(onnxruntime::webgpu::ComputeContext& context,
