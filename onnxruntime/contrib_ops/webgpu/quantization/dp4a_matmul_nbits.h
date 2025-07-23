@@ -82,7 +82,6 @@ class DP4AMatMulNBitsLargeMProgram final : public Program<DP4AMatMulNBitsLargeMP
       {"K32", ProgramUniformVariableDataType::Uint32},
       {"block_size", ProgramUniformVariableDataType::Uint32},
       {"num_N_tile", ProgramUniformVariableDataType::Uint32},
-      {"num_M_tile", ProgramUniformVariableDataType::Uint32},
       {"zero_blocks_per_col", ProgramUniformVariableDataType::Uint32});
 
  private:

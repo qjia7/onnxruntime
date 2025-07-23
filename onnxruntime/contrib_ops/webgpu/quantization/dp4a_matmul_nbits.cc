@@ -618,7 +618,7 @@ Status DP4AMatMulNBitsLargeMProgram::GenerateShaderCode(ShaderHelper& shader) co
   )ADDNL_FN";
 
   shader.MainFunctionBody() << R"MAIN_FN(
-    let a_global_base = u32(workgroup_idx / uniforms.num_M_tile) * tile_size_m;
+    let a_global_base = u32(workgroup_idx / uniforms.num_N_tile) * tile_size_m;
     let b_global_base = (workgroup_idx % uniforms.num_N_tile) * tile_size_n;
     // Handle each workgroup threads as a block of [sub_tile_count][tile_size_k_vec]
     let local_col = local_idx % tile_size_k_vec;
@@ -746,7 +746,7 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
                          {&a_scale, ProgramTensorMetadataDependency::TypeAndRank, 1},
                          {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(kVec4Components * kU32Components)},
                          {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
-      .AddUniformVariables({M, N, K, K / 16, K / 32, block_size, num_N_tile, num_M_tile, zero_blocks_per_col})
+      .AddUniformVariables({M, N, K, K / 16, K / 32, block_size, num_N_tile, zero_blocks_per_col})
       .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, 1})
       .CacheHint(nbits, tile_size_k_vec, tile_size_N, has_zero_points);
   if (has_zero_points) {
