@@ -273,7 +273,7 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
             let b_value = input_b[b_global*uniforms.K16+kidx_v+col];
             let block_idx = kidx_v/(block_size/16);
             let zero = mm_read_zero(b_global, block_idx, uniforms.N, uniforms.zero_blocks_per_col);
-            tile_B[col][row] = DequantizedFrom4BitsTo8Bits(b_value, zero);
+            tile_B[col][row] = DequantizedFrom4BitsTo8Bits(b_value.xy, zero);
             if (col == 0)
             {
                 // kidx_v - each kidx_v covers 16 values of k
@@ -341,17 +341,14 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
         // K's vectrorization is 16 items per index. See input_a/input_b.
         // tile_size_k_vec - is the k tile size in vectorized space (1/16). That is
         // k tile size is 32. In vectorized space that is 32/16 = 2.
-        for (var kidx_v:u32 = 0; kidx_v < uniforms.K16; kidx_v+=tile_size_k_vec)
+        for (var kidx_v:u32 = 0; kidx_v < uniforms.K32; kidx_v+=1)
         {
             // Load Phase: Populate shared memory for the workgroup.
             if (load_AorB == 0)
             {
-                loadSHMA(a_global_base, kidx_v, load_row, load_col);
+                loadSHMA(a_global_base, kidx_v * 2, load_row, load_col);
             }
-            else
-            {
-                loadSHMB(b_global_base, kidx_v, load_row, load_col);
-            }
+
             workgroupBarrier();
 
             // Compute phase: Perform matmul for this subtile 16 x 32 x 16.
@@ -411,22 +408,26 @@ Status DP4AMatMulNBitsProgram::GenerateShaderCode(ShaderHelper& shader) const {
                 }
             } else if (sg_size == 64)
             {
-                var own_b: vec4<u32>;
-                if (sg_id < 32) {
-                    own_b = tile_B[sg_id / 16][base_B + sg_id % 16];
+                var own_b0 = vec4<u32>(0);
+                var own_b1 = vec4<u32>(0);
+                var own_scale_b = output_element_t(0);
+                if (sg_id < 16)
+                {
+                    let b_global = b_global_base + sg_id;
+                    if (b_global < uniforms.N)
+                    {
+                      let b_value = input_b[b_global*uniforms.K32+kidx_v];
+                      let block_idx = (kidx_v * 32)/block_size;
+                      let zero = mm_read_zero(b_global, block_idx, uniforms.N, uniforms.zero_blocks_per_col);
+                      own_b0 = DequantizedFrom4BitsTo8Bits(b_value.xy, zero);
+                      own_b1 = DequantizedFrom4BitsTo8Bits(b_value.zw, zero);
+                      own_scale_b = scales_b[b_global*(uniforms.K/block_size) + block_idx];
+                    }
                 }
+
                 // Step 2: Access registers across the subgroup using subgroupShuffle and perform the matmul.
                 for (var i = 0u; i < 16u; i++) {
-                  lane_outputs[i] += SDP8AI(own_a0, subgroupShuffle(own_b, i), own_a1, subgroupShuffle(own_b, 16 + i), scale_B[base_B + i] * own_scale_a);
-                }
-            }
-            else
-            {
-                // Code for other subgroup sizes, simply doesnt use subgroups at all.
-                // Relies on reads from single location tile_B[][base_B + col] by all
-                // being optimized by the hardware.
-                for (var i = 0u; i < 16u; i++) {
-                  lane_outputs[i] += SDP8AI(own_a0, tile_B[0][base_B + i], own_a1, tile_B[1][base_B + i],  own_scale_a * scale_B[base_B + i]);
+                  lane_outputs[i] += SDP8AI(own_a0, subgroupShuffle(own_b0, i), own_a1, subgroupShuffle(own_b1, i), subgroupShuffle(own_scale_b, i) * own_scale_a);
                 }
             }
     )MAIN_FN";
@@ -597,7 +598,7 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
                                   onnxruntime::webgpu::ComputeContext& context,
                                   Tensor* y) {
   constexpr uint32_t kVec4Components = 4;
-  constexpr uint32_t kVec2Components = 2;
+ // constexpr uint32_t kVec2Components = 2;
   constexpr uint32_t kU32Components = 4;
 
   constexpr uint32_t kBlockSizeA = 128;
@@ -650,13 +651,13 @@ Status ApplyDP4AMatrixMatMulNBits(const Tensor* a, const Tensor* b, const Tensor
   mul_program.SetDispatchGroupSize(num_M_tile * num_N_tile);
   mul_program.AddInputs({{&a_quant, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(kVec4Components)},
                          {&a_scale, ProgramTensorMetadataDependency::TypeAndRank, 1},
-                         {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(nbits == 4 ? kVec2Components * kU32Components : kVec4Components * kU32Components)},
+                         {b, ProgramTensorMetadataDependency::TypeAndRank, static_cast<int>(nbits == 4 ? kVec4Components * kU32Components : kVec4Components * kU32Components)},
                          {scales, ProgramTensorMetadataDependency::TypeAndRank, 1}})
       .AddUniformVariables({{static_cast<uint32_t>(M)},
                             {static_cast<uint32_t>(N)},
                             {static_cast<uint32_t>(K)},
-                            {static_cast<uint32_t>(K / 8)},
                             {static_cast<uint32_t>(K / 16)},
+                            {static_cast<uint32_t>(K / 32)},
                             {num_N_tile},
                             {zero_blocks_per_col}})
       .AddOutput({y, ProgramTensorMetadataDependency::TypeAndRank, reshaped_y_shape, static_cast<int>(kVec4Components)})
